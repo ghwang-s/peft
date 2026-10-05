@@ -30,6 +30,7 @@ from safetensors.torch import load_file as safe_load_file
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification
 from transformers.pytorch_utils import Conv1D
@@ -8270,6 +8271,50 @@ class TestPeftFsdpStateDict:
     def prepare_inputs_for_testing(self):
         X = torch.arange(90).view(9, 10).to(self.torch_device)
         return {"X": X}
+
+    @pytest.mark.parametrize("bias", ["none", "all", "lora_only"])
+    @pytest.mark.parametrize("adapter_name", ["default", "other"])
+    @pytest.mark.parametrize("pass_state_dict", [False, True])
+    def test_save_load_roundtrip_fsdp_auto_wrapped(self, bias, adapter_name, pass_state_dict):
+        # Nested FSDP wrappers disappear from state dict keys, including trainable bias keys.
+        config = LoraConfig(target_modules=["lin0", "lin1"], bias=bias, init_lora_weights=False)
+        model = self.transformers_class.from_pretrained("MLP").to(self.torch_device)
+        model = get_peft_model(model, config, adapter_name=adapter_name).eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.requires_grad:
+                    parameter.add_(0.1)
+        expected_state = {
+            key: value.detach().clone()
+            for key, value in get_peft_model_state_dict(model, adapter_name=adapter_name).items()
+        }
+        model = FSDP(
+            model,
+            use_orig_params=True,
+            device_id=self.torch_device,
+            auto_wrap_policy=partial(transformer_auto_wrap_policy, transformer_layer_cls={MLP}),
+        )
+        inputs = self.prepare_inputs_for_testing()
+        with torch.no_grad():
+            output_before = model(**inputs)
+        if pass_state_dict:
+            state_dict = get_peft_model_state_dict(
+                model.module, state_dict=model.state_dict(), adapter_name=adapter_name
+            )
+        else:
+            state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
+        assert state_dict.keys() == expected_state.keys()
+        for key in expected_state:
+            torch.testing.assert_close(state_dict[key], expected_state[key])
+        del model
+
+        model = self.transformers_class.from_pretrained("MLP").to(self.torch_device)
+        model = get_peft_model(model, config, adapter_name=adapter_name).eval()
+        with torch.no_grad():
+            assert not torch.allclose(model(**inputs), output_before)
+        set_peft_model_state_dict(model, state_dict, adapter_name=adapter_name)
+        with torch.no_grad():
+            torch.testing.assert_close(model(**inputs), output_before)
 
     @pytest.mark.parametrize("test_name, model_id, config_cls, config_kwargs", TEST_CASES)
     def test_save_load_roundtrip_fsdp_wrapped(self, test_name, model_id, config_cls, config_kwargs):

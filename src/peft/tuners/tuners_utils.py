@@ -1560,8 +1560,8 @@ class BaseTuner(nn.Module, ABC):
         bias_state_dict = {}
         if bias.endswith("_only"):  # e.g. 'lora_only'
             for module_name, module in model.named_modules():
-                if module_name.startswith("_fsdp_wrapped_module."):
-                    module_name = module_name.removeprefix("_fsdp_wrapped_module.")
+                if "_fsdp_wrapped_module." in module_name:
+                    module_name = module_name.replace("_fsdp_wrapped_module.", "")
                 if not isinstance(module, BaseTunerLayer):
                     continue
                 # the bias of the targeted module is located on the base layer of the tuner layer
@@ -1776,10 +1776,9 @@ def _get_tuner_state_dict_key_prefixes(model: nn.Module, adapter_name: Optional[
     # layers nested inside of it
     aux_module_names = set()
     for module_name, module in model.named_modules():
-        if module_name.startswith("_fsdp_wrapped_module."):
-            # If FSDP is used, the state_dict is from the unwrapped model, which would result in a key mismatch if we
-            # didn't remove the FSDP-specific prefix
-            module_name = module_name.removeprefix("_fsdp_wrapped_module.")
+        if "_fsdp_wrapped_module." in module_name:
+            # FSDP removes wrapper segments at every nesting level from state dict keys.
+            module_name = module_name.replace("_fsdp_wrapped_module.", "")
 
         if isinstance(module, AuxiliaryTrainingWrapper):
             aux_module_names.add(module_name)
